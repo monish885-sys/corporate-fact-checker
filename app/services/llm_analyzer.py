@@ -1,40 +1,13 @@
 """
-LLM analyzer service using Google Gemini API.
+LLM analyzer using Ollama (local, free).
 """
 from typing import Dict
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from app.config import get_gemini_api_key, validate_config
+import requests
+from app.config import get_ollama_model
 
 
-class FactChecker:
-    """Class to analyze financial claims using Google Gemini."""
-    
-    def __init__(self):
-        """Initialize the FactChecker with Gemini client."""
-        api_key = get_gemini_api_key()
-        if not api_key or not validate_config():
-            raise ValueError(
-                "Gemini API key not found. Please set GEMINI_API_KEY in your .env file."
-            )
-        genai.configure(api_key=api_key)
-        # Use gemini-2.5-flash for fast, reliable responses
-        # Alternative: gemini-2.5-pro for better quality, gemini-flash-latest for latest version
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
-    
-    def analyze_claims(self, financial_data: Dict[str, str], transcript_text: str) -> str:
-        """
-        Analyze claims in the transcript against financial data.
-        
-        Args:
-            financial_data: Dictionary containing financial metrics
-            transcript_text: Text containing claims to verify
-            
-        Returns:
-            str: Markdown-formatted analysis report
-        """
-        # Format comprehensive financial data for the prompt
-        financial_context = f"""
+def _build_financial_context(financial_data: Dict[str, str]) -> str:
+    return f"""
 COMPANY INFORMATION:
 Ticker: {financial_data.get('Ticker', 'N/A')}
 Company: {financial_data.get('Company Name', 'N/A')}
@@ -81,9 +54,16 @@ Quick Ratio: {financial_data.get('Quick Ratio', 'N/A')}
 LEVERAGE RATIOS:
 Debt-to-Equity: {financial_data.get('Debt-to-Equity', 'N/A')}
 Debt-to-Assets: {financial_data.get('Debt-to-Assets', 'N/A')}
+
+TRUTH-CHECK RATIOS (critical for manufacturing/FMCG and Indian markets):
+Interest Expense: {financial_data.get('Interest Expense', 'N/A')}
+Cash Conversion (CFO/EBITDA): {financial_data.get('Cash Conversion (CFO/EBITDA)', 'N/A')}  — Profits in bank vs on paper; low or negative CFO vs high EBITDA = red flag (accruals, not cash).
+Asset Turnover: {financial_data.get('Asset Turnover', 'N/A')}  — Revenue/Assets; if revenue grows but ratio falls, company is scaling less efficiently.
+Interest Coverage: {financial_data.get('Interest Coverage', 'N/A')}  — Operating Income/Interest; ability to service debt; crucial when interest rates fluctuate (e.g. India).
 """
-        
-        system_prompt = """You are an expert forensic financial analyst with deep expertise in corporate financial analysis. Your job is to perform a comprehensive fact-check by comparing a company's actual audited financial data against claims made in earnings calls, press releases, or news articles.
+
+
+SYSTEM_PROMPT = """You are an expert forensic financial analyst with deep expertise in corporate financial analysis. Your job is to perform a comprehensive fact-check by comparing a company's actual audited financial data against claims made in earnings calls, press releases, or news articles.
 
 ANALYSIS FRAMEWORK:
 1. **Revenue & Growth Claims**: Verify claims about revenue growth, market share, sales performance against actual Total Revenue, Gross Profit, and Operating Income.
@@ -97,6 +77,11 @@ ANALYSIS FRAMEWORK:
 5. **Valuation Claims**: Verify market cap, P/E ratio, and valuation claims against provided metrics.
 
 6. **Cash Flow Claims**: Validate cash flow statements using Operating Cash Flow, Free Cash Flow, and Capital Expenditure data.
+
+7. **TRUTH-CHECK RATIOS (especially for Indian manufacturing/FMCG)**:
+   - **CFO to EBITDA (Cash Conversion Ratio)**: If the CEO claims "record EBITDA" or "strong profitability" but Cash Conversion (CFO/EBITDA) is low, below 1x, or negative, FLAG this as a major red flag—profits may be on paper (accruals) and not in the bank. High EBITDA with low/negative CFO suggests quality-of-earnings risk.
+   - **Asset Turnover (Revenue/Assets)**: If the CEO claims "scaling efficiently" or "capital efficiency" but Asset Turnover is declining (or low) while revenue is growing, FLAG it—the company may be adding assets faster than revenue, i.e. becoming less efficient.
+   - **Interest Coverage (Operating Income/Interest Expense)**: If the CEO downplays debt or interest risk but Interest Coverage is low (e.g. below 2–3x) or falling, FLAG it—this is a leading indicator of default risk, especially important in rate-sensitive markets like India.
 
 INSTRUCTIONS:
 - Analyze ALL financial claims in the text systematically
@@ -116,6 +101,25 @@ OUTPUT FORMAT:
 - Structure: Executive Summary → Detailed Analysis → Truth Score → Key Findings
 - Be thorough, professional, and evidence-based"""
 
+
+def _error_msg(generic: str, detail: str = "") -> str:
+    return f"## Error in Analysis\n\n❌ **Error:** {detail or generic}\n\nEnsure Ollama is running (ollama run llama3.2) and try again."
+
+
+class FactChecker:
+    """Analyze financial claims using Ollama (local)."""
+
+    def __init__(self):
+        pass
+
+    def analyze_claims(self, financial_data: Dict[str, str], transcript_text: str) -> str:
+        """
+        Analyze claims in the transcript against financial data.
+
+        Returns:
+            str: Markdown-formatted analysis report
+        """
+        financial_context = _build_financial_context(financial_data)
         user_prompt = f"""CONTEXT (THE TRUTH):
 {financial_context}
 
@@ -125,68 +129,37 @@ USER INPUT (THE CLAIM):
 Please analyze the claims in the text above against the financial data provided. Flag any contradictions and provide a Truth Score out of 10."""
 
         try:
-            # Combine system and user prompts for Gemini
-            full_prompt = f"{system_prompt}\n\n{user_prompt}"
-            
-            # Configure generation parameters for more detailed analysis
-            generation_config = {
-                "temperature": 0.2,  # Lower temperature for more factual, consistent analysis
-                "max_output_tokens": 2500,  # Increased for comprehensive analysis
-            }
-            
-            # Remove safety filters completely for financial content analysis
-            # Financial transcripts should not be blocked
-            safety_settings = [
-                {
-                    "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-                    "threshold": HarmBlockThreshold.BLOCK_NONE
-                },
-                {
-                    "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                    "threshold": HarmBlockThreshold.BLOCK_NONE
-                },
-                {
-                    "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                    "threshold": HarmBlockThreshold.BLOCK_NONE
-                },
-                {
-                    "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                    "threshold": HarmBlockThreshold.BLOCK_NONE
-                }
-            ]
-            
-            response = self.model.generate_content(
-                full_prompt,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-            
-            # Check if response was blocked
-            if response.candidates and len(response.candidates) > 0:
-                candidate = response.candidates[0]
-                if candidate.finish_reason == 2:  # SAFETY
-                    return "## Error in Analysis\n\n⚠️ **Response Blocked:** The content was blocked by safety filters. This may happen if the transcript contains sensitive content. Please try with a different transcript or contact support if this persists."
-                elif candidate.finish_reason == 3:  # RECITATION
-                    return "## Error in Analysis\n\n⚠️ **Response Blocked:** The content was blocked due to potential recitation concerns. Please try with a different transcript."
-                elif candidate.finish_reason == 4:  # OTHER
-                    return "## Error in Analysis\n\n⚠️ **Response Blocked:** The content was blocked for other reasons. Please try again or use a different transcript."
-            
-            # Check if response has text content
-            if hasattr(response, 'text') and response.text:
-                return response.text
-            elif response.candidates and len(response.candidates) > 0:
-                # Try to get text from parts
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                    text_parts = [part.text for part in candidate.content.parts if hasattr(part, 'text')]
-                    if text_parts:
-                        return ''.join(text_parts)
-            
-            return "## Error in Analysis\n\n⚠️ **No Response:** The API did not return any content. Please try again."
-            
+            return _call_ollama(user_prompt)
         except Exception as e:
-            error_msg = str(e)
-            if "finish_reason" in error_msg or "response.text" in error_msg:
-                return "## Error in Analysis\n\n⚠️ **Response Blocked:** The content was filtered by safety settings. This can happen with certain financial terminology or content. Please try:\n\n1. Simplifying the transcript text\n2. Removing any potentially sensitive content\n3. Trying again with a different transcript"
-            return f"## Error in Analysis\n\n❌ **Error:** {error_msg}\n\nPlease check your Gemini API key and try again."
+            return _error_msg("LLM request failed.", str(e))
 
+
+def _call_ollama(user_prompt: str) -> str:
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+    model = get_ollama_model()
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model,
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 2500},
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=120)
+        r.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        return _error_msg(
+            "Cannot reach Ollama.",
+            "Is Ollama running? Install from ollama.com and run: ollama run " + model,
+        )
+    except requests.exceptions.Timeout:
+        return _error_msg("Ollama request timed out. Try a smaller model or shorter transcript.")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return _error_msg("Ollama model not found.", f"Run: ollama run {model}")
+        return _error_msg("Ollama error.", str(e))
+    data = r.json()
+    text = (data.get("response") or "").strip()
+    if not text:
+        return "## Error in Analysis\n\n⚠️ **No Response:** Ollama returned empty text. Try another model (e.g. ollama run mistral)."
+    return text

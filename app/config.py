@@ -1,33 +1,23 @@
 """
-Configuration module for loading environment variables.
+Configuration module. LLM: Ollama only (local, no API key).
 """
 import os
-from typing import Optional
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
 
-def get_gemini_api_key() -> Optional[str]:
-    """
-    Retrieve the Gemini API key from environment variables.
-    
-    Returns:
-        Optional[str]: The API key if found, None otherwise
-    """
-    return os.getenv("GEMINI_API_KEY")
+def get_ollama_model() -> str:
+    """Ollama model name (e.g. llama3.2, mistral). Default: llama3.2"""
+    raw = os.getenv("OLLAMA_MODEL") or "llama3.2"
+    return (raw.strip() or "llama3.2")
 
 
 def validate_config() -> bool:
-    """
-    Validate that all required configuration is present.
-    
-    Returns:
-        bool: True if configuration is valid, False otherwise
-    """
-    api_key = get_gemini_api_key()
-    if not api_key or api_key == "your_key_here":
-        return False
+    """Always True; analysis uses Ollama (no key required)."""
     return True
 
+
+def get_llm_display_name() -> str:
+    """Human-readable name of the LLM backend."""
+    return "Ollama"

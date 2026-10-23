@@ -5,6 +5,25 @@ import yfinance as yf
 from typing import Dict, Optional
 import pandas as pd
 
+# User-friendly message when Yahoo Finance is unreachable (DNS/network)
+NETWORK_ERROR_MESSAGE = (
+    "Cannot reach Yahoo Finance (query1.finance.yahoo.com). "
+    "Check your internet connection and DNS. If you use a VPN or corporate network, try disabling it or using another network."
+)
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """True if the exception is due to DNS/connection (e.g. could not resolve host)."""
+    msg = (getattr(exc, "message", "") or str(exc)).lower()
+    return (
+        "could not resolve host" in msg
+        or "resolve host" in msg
+        or "name or service not known" in msg
+        or "connection" in msg
+        or "yahoo" in msg
+        or "nodename nor servname" in msg
+    )
+
 
 class FinanceFetcher:
     """Class to fetch and process financial data from Yahoo Finance."""
@@ -104,6 +123,12 @@ class FinanceFetcher:
                 # Leverage Ratios
                 "Debt-to-Equity": "N/A",
                 "Debt-to-Assets": "N/A",
+                
+                # Truth-Check Ratios (critical for manufacturing/FMCG and Indian markets)
+                "Interest Expense": "Data Unavailable",
+                "Cash Conversion (CFO/EBITDA)": "N/A",  # CFO to EBITDA – profits in bank vs on paper
+                "Asset Turnover": "N/A",                 # Revenue/Assets – capital efficiency
+                "Interest Coverage": "N/A",              # EBIT/Interest – ability to service debt
             }
             
             # Extract most recent year's data (first column is usually the most recent)
@@ -141,6 +166,12 @@ class FinanceFetcher:
                     ebitda = financials.loc["EBITDA"].iloc[0]
                     if not pd.isna(ebitda):
                         result["EBITDA"] = self.format_number(ebitda)
+                
+                # Interest Expense (for Interest Coverage ratio)
+                if "Interest Expense" in financials.index:
+                    int_exp = financials.loc["Interest Expense"].iloc[0]
+                    if not pd.isna(int_exp):
+                        result["Interest Expense"] = self.format_number(abs(int_exp))
             
             # Balance Sheet Metrics
             if balance_sheet is not None and not balance_sheet.empty:
@@ -253,6 +284,11 @@ class FinanceFetcher:
                 curr_liab_raw = None
                 cash_raw = None
                 
+                ocf_raw = None
+                ebitda_raw = None
+                interest_expense_raw = None
+                op_income_raw = None
+                
                 if financials is not None and not financials.empty:
                     if "Net Income" in financials.index:
                         net_income_raw = financials.loc["Net Income"].iloc[0]
@@ -260,6 +296,22 @@ class FinanceFetcher:
                         revenue_raw = financials.loc["Total Revenue"].iloc[0]
                     elif "Revenue" in financials.index:
                         revenue_raw = financials.loc["Revenue"].iloc[0]
+                    if "Operating Income" in financials.index:
+                        op_income_raw = financials.loc["Operating Income"].iloc[0]
+                    if "EBITDA" in financials.index:
+                        ebitda_raw = financials.loc["EBITDA"].iloc[0]
+                    if "Interest Expense" in financials.index:
+                        interest_expense_raw = financials.loc["Interest Expense"].iloc[0]
+                        if pd.isna(interest_expense_raw):
+                            interest_expense_raw = None
+                        elif interest_expense_raw != 0:
+                            interest_expense_raw = abs(interest_expense_raw)
+                
+                if cashflow is not None and not cashflow.empty:
+                    if "Total Cash From Operating Activities" in cashflow.index:
+                        ocf_raw = cashflow.loc["Total Cash From Operating Activities"].iloc[0]
+                    elif "Operating Cash Flow" in cashflow.index:
+                        ocf_raw = cashflow.loc["Operating Cash Flow"].iloc[0]
                 
                 if balance_sheet is not None and not balance_sheet.empty:
                     if "Total Assets" in balance_sheet.index:
@@ -322,6 +374,22 @@ class FinanceFetcher:
                 if debt_raw and assets_raw and not pd.isna(debt_raw) and not pd.isna(assets_raw) and assets_raw != 0:
                     debt_to_assets = (debt_raw / assets_raw) * 100
                     result["Debt-to-Assets"] = f"{debt_to_assets:.2f}%"
+                
+                # Cash Conversion Ratio (CFO / EBITDA) – key truth-check: profits in bank vs on paper
+                if ocf_raw is not None and ebitda_raw is not None and not pd.isna(ocf_raw) and not pd.isna(ebitda_raw) and ebitda_raw != 0:
+                    cash_conversion = (ocf_raw / ebitda_raw)
+                    result["Cash Conversion (CFO/EBITDA)"] = f"{cash_conversion:.2f}x"
+                
+                # Asset Turnover (Revenue / Total Assets) – capital efficiency; falling = less efficient "scaling"
+                if revenue_raw and assets_raw and not pd.isna(revenue_raw) and not pd.isna(assets_raw) and assets_raw != 0:
+                    asset_turnover = revenue_raw / assets_raw
+                    result["Asset Turnover"] = f"{asset_turnover:.2f}x"
+                
+                # Interest Coverage (Operating Income / Interest Expense) – ability to service debt
+                if op_income_raw is not None and interest_expense_raw is not None and interest_expense_raw != 0:
+                    if not pd.isna(op_income_raw):
+                        interest_coverage = op_income_raw / interest_expense_raw
+                        result["Interest Coverage"] = f"{interest_coverage:.2f}x"
                     
             except Exception as calc_error:
                 # If ratio calculation fails, continue with available data
@@ -330,11 +398,14 @@ class FinanceFetcher:
             return result
             
         except Exception as e:
-            # Return error state
+            # Return error state with a clear message for network/DNS failures
+            err_msg = str(e)
+            if _is_network_error(e):
+                err_msg = NETWORK_ERROR_MESSAGE
             return {
                 "Ticker": ticker.upper(),
                 "Company Name": "Error",
-                "Error": str(e)
+                "Error": err_msg,
             }
     
     def get_historical_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
@@ -352,7 +423,7 @@ class FinanceFetcher:
             stock = yf.Ticker(ticker.upper())
             hist = stock.history(period=period)
             return hist
-        except Exception as e:
+        except Exception:
             return pd.DataFrame()
     
     def get_financial_history(self, ticker: str, metric: str = "revenue", years: int = 5) -> Dict:

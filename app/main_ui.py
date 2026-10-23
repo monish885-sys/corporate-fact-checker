@@ -1,5 +1,6 @@
 """
 Main Streamlit UI for The Corporate Fact-Checker.
+Supports Global (US) and India markets with NSE/BSE, SEBI filings, and Screener.in.
 """
 import streamlit as st
 import pandas as pd
@@ -7,7 +8,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from app.services.finance_data import FinanceFetcher
 from app.services.llm_analyzer import FactChecker
-from app.config import validate_config
+from app.config import get_llm_display_name
+from app.services.india_finance_data import IndiaFinanceFetcher
+from app.services.sebi_filings import get_filing_links, get_brsr_download_note
+from app.services.screener_scraper import get_10_year_trends
 
 
 def main():
@@ -24,23 +28,41 @@ def main():
     st.title("🔍 The Corporate Fact-Checker")
     st.markdown("### Financial Grounding Tool")
     st.markdown("Verify claims in CEO transcripts and news articles against actual financial data.")
-    
+
     # Initialize session state
     if "financial_data" not in st.session_state:
         st.session_state.financial_data = None
     if "ticker" not in st.session_state:
         st.session_state.ticker = "TSLA"
+    if "market" not in st.session_state:
+        st.session_state.market = "Global"
     
     # Sidebar
     with st.sidebar:
+        st.caption(f"LLM: **{get_llm_display_name()}**")
         st.header("📊 Financial Data")
         
-        # Ticker input
+        # Market selector: Global (US) vs India
+        market = st.radio(
+            "Market",
+            options=["Global", "India"],
+            index=0 if st.session_state.market == "Global" else 1,
+            help="Global: US stocks (Yahoo Finance). India: NSE/BSE (NSEPython + yfinance)"
+        )
+        st.session_state.market = market
+        
+        placeholder = "e.g., RELIANCE, TCS, INFY" if market == "India" else "e.g., AAPL, TSLA, MSFT"
+        default_ticker = "RELIANCE" if market == "India" else "TSLA"
+        if st.session_state.ticker == "RELIANCE" and market == "Global":
+            st.session_state.ticker = default_ticker
+        if st.session_state.ticker == "TSLA" and market == "India":
+            st.session_state.ticker = default_ticker
+        
         ticker_input = st.text_input(
             "Stock Ticker",
             value=st.session_state.ticker,
-            placeholder="e.g., AAPL, TSLA, MSFT",
-            help="Enter a valid stock ticker symbol"
+            placeholder=placeholder,
+            help="NSE symbol for India (e.g. RELIANCE), US symbol for Global"
         )
         
         # Fetch button
@@ -48,8 +70,12 @@ def main():
             if ticker_input:
                 st.session_state.ticker = ticker_input.upper()
                 with st.spinner(f"Fetching financial data for {ticker_input.upper()}..."):
-                    fetcher = FinanceFetcher()
-                    st.session_state.financial_data = fetcher.get_metrics(ticker_input)
+                    if market == "India":
+                        fetcher = IndiaFinanceFetcher()
+                        st.session_state.financial_data = fetcher.get_metrics(ticker_input)
+                    else:
+                        fetcher = FinanceFetcher()
+                        st.session_state.financial_data = fetcher.get_metrics(ticker_input)
                 st.success("Financial data fetched!")
             else:
                 st.error("Please enter a stock ticker.")
@@ -86,6 +112,22 @@ def main():
                     with col4:
                         st.metric("ROE", st.session_state.financial_data.get("ROE", "N/A"))
                     
+                    # Truth-Check Ratios (CFO/EBITDA, Asset Turnover, Interest Coverage)
+                    st.subheader("🔬 Truth-Check Ratios")
+                    st.caption("Critical for manufacturing/FMCG and Indian markets: cash conversion, capital efficiency, debt serviceability.")
+                    col1t, col2t, col3t, col4t = st.columns(4)
+                    with col1t:
+                        st.metric("Cash Conversion (CFO/EBITDA)", st.session_state.financial_data.get("Cash Conversion (CFO/EBITDA)", "N/A"))
+                        st.caption("Profits in bank vs on paper")
+                    with col2t:
+                        st.metric("Asset Turnover", st.session_state.financial_data.get("Asset Turnover", "N/A"))
+                        st.caption("Revenue/Assets – efficiency")
+                    with col3t:
+                        st.metric("Interest Coverage", st.session_state.financial_data.get("Interest Coverage", "N/A"))
+                        st.caption("Ability to service debt")
+                    with col4t:
+                        st.metric("Interest Expense", st.session_state.financial_data.get("Interest Expense", "N/A"))
+                    
                     # Profitability Ratios Chart
                     st.subheader("Profitability Ratios")
                     profitability_data = {
@@ -112,7 +154,10 @@ def main():
                     # Stock Price Chart
                     st.subheader("Stock Price History (1 Year)")
                     try:
-                        fetcher = FinanceFetcher()
+                        if st.session_state.market == "India":
+                            fetcher = IndiaFinanceFetcher()
+                        else:
+                            fetcher = FinanceFetcher()
                         hist_data = fetcher.get_historical_data(ticker, period="1y")
                         if not hist_data.empty:
                             fig = go.Figure()
@@ -123,10 +168,11 @@ def main():
                                 name='Close Price',
                                 line=dict(color='#1f77b4', width=2)
                             ))
+                            yaxis_label = "Price (₹)" if st.session_state.get("market") == "India" else "Price ($)"
                             fig.update_layout(
                                 title="Stock Price Over Time",
                                 xaxis_title="Date",
-                                yaxis_title="Price ($)",
+                                yaxis_title=yaxis_label,
                                 height=400,
                                 hovermode='x unified'
                             )
@@ -211,6 +257,53 @@ def main():
                     
                     valuation_df = pd.DataFrame(list(valuation_metrics.items()), columns=["Metric", "Value"])
                     st.dataframe(valuation_df, use_container_width=True, hide_index=True)
+                
+                # India-only: Corporate Actions, SEBI Filings, Screener.in
+                if st.session_state.get("market") == "India" and ticker:
+                    st.markdown("---")
+                    st.subheader("🇮🇳 India-specific data")
+                    
+                    # Corporate Actions
+                    corp_actions = st.session_state.financial_data.get("Corporate Actions", "N/A")
+                    st.metric("Corporate Actions (dividends, splits)", corp_actions)
+                    try:
+                        india_fetcher = IndiaFinanceFetcher()
+                        actions_list = india_fetcher.get_corporate_actions(ticker)
+                        if actions_list:
+                            st.caption("Recent corporate actions")
+                            for a in actions_list[:5]:
+                                if isinstance(a, dict):
+                                    st.text(f"• {a.get('date', '')} {a.get('type', '')} {a.get('value', '')}")
+                                else:
+                                    st.text(str(a))
+                    except Exception:
+                        pass
+                    
+                    # SEBI / BSE / NSE Filings
+                    with st.expander("📄 SEBI / BRSR & Investor Presentations"):
+                        st.markdown(get_brsr_download_note(ticker))
+                        links = get_filing_links(ticker)
+                        for label, url in links.items():
+                            st.markdown(f"- [{label}]({url})")
+                    
+    
+    # India: Screener.in 10-year trends (main area, on-demand)
+    if st.session_state.get("financial_data") and st.session_state.get("market") == "India":
+        ticker_for_screener = st.session_state.get("ticker", "")
+        with st.expander("📈 Screener.in – 10-Year Fundamental Trends", expanded=False):
+            st.caption("Data from Screener.in (Indian investors rely on long-term fundamental consistency).")
+            if st.button("Fetch Screener.in data", key="fetch_screener"):
+                with st.spinner("Loading Screener.in data..."):
+                    screener_data = get_10_year_trends(ticker_for_screener)
+                    if screener_data.get("error"):
+                        st.warning(screener_data["error"])
+                    elif screener_data.get("trends_10y"):
+                        df = pd.DataFrame(screener_data["trends_10y"])
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        if screener_data.get("screener_url"):
+                            st.markdown(f"[Open on Screener.in]({screener_data['screener_url']})")
+                    else:
+                        st.info("No 10-year trend data found. Try opening the company page on Screener.in directly.")
     
     # Main content area
     st.header("📝 Transcript / News Analysis")
@@ -230,8 +323,6 @@ def main():
             st.error("Please enter some text to analyze.")
         elif not st.session_state.financial_data:
             st.error("Please fetch financial data first using the sidebar.")
-        elif not validate_config():
-            st.error("⚠️ Gemini API key not configured. Please set GEMINI_API_KEY in your .env file.")
         else:
             # Run analysis
             with st.spinner("🔍 Analyzing claims against financial data..."):
